@@ -18,7 +18,9 @@ def find_chunk_boundaries(
     split_special_token: bytes,
 ) -> list[int]:
     """
-    将文本分成若干个chunk，每个chunk最好以特殊token开头(第一个chunk除外)
+    将文本分成若干个chunk，每个chunk以特殊token开头(第一个chunk除外)
+    把一个大文本文件划分成多个适合多进程处理的区间
+    返回每一个chunk的第一个byte的位置
     """
     assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
     
@@ -64,6 +66,10 @@ def count_chunk(
         end: int,
         special_tokens: list[str]
 ) -> Counter:
+    '''
+    统计函数
+    读取训练文件的一个指定区间，去掉特殊 token，对普通文本进行预分词，然后统计每个 pre-token 出现了多少次
+    '''
     with open(input_path, 'rb') as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
@@ -85,7 +91,8 @@ def count_chunk(
 def train_bpe(
         input_path: str,
         vocab_size: int,
-        special_tokens: list[str]
+        special_tokens: list[str],
+        num_processes: int = 24,
 ) -> tuple[dict[int,bytes],list[tuple[bytes,bytes]]]:
     """
     假设vocabulary的size一定够用
@@ -99,9 +106,8 @@ def train_bpe(
     index = 256 + len(special_tokens)   #记录下一个新词的索引
 
     with open(input_path, "rb") as f:
-        num_processes = 6
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
+        #并行构建frequency
         task = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1],boundaries[1:])]
         with Pool(processes = num_processes) as pool:
             counters = pool.starmap(count_chunk, task)
@@ -118,9 +124,9 @@ def train_bpe(
     #选出出现次数最多的pair
     merges = []
     while index < vocab_size:
-        max_pair = max(pairs,key = lambda pair: (pairs[pair],pair))
-        vocab[index] = max_pair[0] + max_pair[1]
-        merges.append(max_pair)
+        max_pair = max(pairs,key = lambda pair: (pairs[pair],pair))   #关键，可以进行改进！！！
+        vocab[index] = max_pair[0] + max_pair[1]   #更新vocab
+        merges.append(max_pair)     #更新merges
         #merge，修改frequency，pair，pair_word
         for word in pair_word[max_pair].copy():  #因为我们要修改pair_word
             n = len(word)
@@ -153,11 +159,9 @@ def train_bpe(
                     pairs.pop(old_pair, None)
                     pair_word.pop(old_pair, None)
             for new_pair in zip(new_word[:-1],new_word[1:]):
-                pair_word[new_pair].discard(word)
                 pair_word[new_pair].add(new_word)
         pairs.pop(max_pair,None)
         index += 1
-        print(index)
 
     return vocab, merges
 
@@ -165,12 +169,15 @@ class Tokenizer():
     def __init__(self,vocab,merges,special_tokens = None):
         self.vocab = vocab
         self.merges = merges
-        self.max = len(self.merges)
+        self.max = len(self.merges)   #rank最大也不可能达到的值
         self.special_tokens = special_tokens
         self.reverse_vocab = {token: ids for ids,token in self.vocab.items()}
         self.reverse_merge = defaultdict(lambda: self.max)
         for i in range(len(merges)):
-            self.reverse_merge[merges[i]] = i
+            self.reverse_merge[merges[i]] = i    #记录每个merge的rank，rank越小优先级越高
+
+        self.patterns = "|".join(re.escape(special)
+                for special in sorted(self.special_tokens, key=len, reverse=True))
     @classmethod
     def from_files(
             cls,
@@ -189,13 +196,14 @@ class Tokenizer():
             merges=merges,
             special_tokens=special_tokens,
         )
+    #对pre_token级别进行缓存
     @lru_cache(maxsize=100_000)
     def encode_word(self,pre_token:str) -> list[int]:  #对单个pre-token进行encode，加入cache
         word = [bytes([x]) for x in pre_token.encode('utf-8')]
         while len(word) > 1:
             ranks = {pair:self.reverse_merge[pair] for pair in zip(word[:-1],word[1:])}
             merge = min(ranks,key = ranks.get)
-            if ranks[merge] == self.max:
+            if ranks[merge] == self.max:   #没有可以merge的了
                 break
             else:
                 new_word = []
@@ -215,14 +223,12 @@ class Tokenizer():
         return [self.reverse_vocab[x] for x in word]
     def encode(self, text: str) -> list[int]:
         tokens = []
-        if self.special_tokens == None or self.special_tokens == []:
+        if not self.special_tokens:
             for pre_token in re.finditer(PAT,text):
                 pre_token = pre_token.group()
                 tokens.extend(self.encode_word(pre_token))
         else:
-            patterns = "|".join(re.escape(special)
-                    for special in sorted(self.special_tokens, key=len, reverse=True))
-            parts = re.split(f"({patterns})", text) #保留特殊token
+            parts = re.split(f"({self.patterns})", text) #保留特殊token
             for part in parts:
                 if part in self.special_tokens:
                     tokens.append(self.reverse_vocab[part.encode('utf-8')])
@@ -233,8 +239,7 @@ class Tokenizer():
         return tokens
     def encode_iterable(self,iterable:Iterable[str]) -> Iterator[int]:
         for text in iterable:
-            for token_id in self.encode(text):
-                yield token_id
+            yield from self.encode(text)
     def decode(self, ids: list[int]) -> str:
         b_text = b''    #必须先合并byte，再解码，不能逐个解码
         for i in ids:
@@ -243,12 +248,3 @@ class Tokenizer():
         return text
 
 
-
-"""
-def main():
-    input_path = "data/TinyStoriesV2-GPT4-train.txt"
-    vocab, merges = train_bpe(input_path,10000,["<|endoftext|>"])
-    return
-if __name__ == "__main__":
-    main()
-    """

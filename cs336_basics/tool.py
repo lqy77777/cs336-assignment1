@@ -9,6 +9,7 @@ from typing import BinaryIO,IO
 from pathlib import Path
 from cs336_basics.bpe import Tokenizer
 from optimization import cross_entropy
+from itertools import islice
 
 def data_loading(
         token_ids: Int[np.ndarray,"num_tokens"],
@@ -51,7 +52,7 @@ def load_checkpoint(
     optimizer.load_state_dict(obj['opt'])
     return obj['iteration']
 
-def save_json(
+def save_bpe(
         vocab: dict[int,bytes],
         merges: list[tuple[bytes,bytes]],
         special_tokens: list[str],
@@ -71,25 +72,63 @@ def save_json(
         f.write("\n")
     return
 
+def iter_documents(
+    file,  #已经以文本模式打开的文件对象
+    delimiter="<|endoftext|>",
+    chunk_size=1024 * 1024,
+):
+    '''
+    从一个很大的文本文件中分块读取内容，并按照 <|endoftext|> 将文件逐篇切分成文档。
+    定义一个生成器函数。调用它时不会立即读取文件，只有开始遍历返回的生成器时，函数才真正执行。
+    '''
+    buffer = ""
+
+    while chunk := file.read(chunk_size):    #海象运算符 :=，它同时完成赋值和条件判断
+        buffer += chunk
+        parts = buffer.split(delimiter)
+
+        for document in parts[:-1]:
+            yield document + delimiter
+
+        buffer = parts[-1]   #最后一个未完成部分
+
+    if buffer:
+        yield buffer
+
 def tokenize_text_to_bin(
-        tokenizer: Tokenizer,
-        input_path: str | os.PathLike,
-        output_path: str |os.PathLike,
-        dtype: np.dtype = None
-) -> int:
+    tokenizer,
+    input_path,
+    output_path,
+    dtype,
+    batch_size=1_000_000,
+):
     """
-    返回值：写入的token_总数
+    从大型文本文件中逐篇读取文档。
+    使用 tokenizer 将文本转换成 token ID。
+    每次收集固定数量的 token ID。
+    将它们以 uint16 二进制格式分批写入磁盘。
+    dtype:决定每个 token ID 以什么数字格式保存到二进制文件中,uint16的可表示的范围是 0～65535
+    返回总 token 数量。
     """
-    input_path = Path(input_path)
-    output_path = Path(output_path)
-    num_tokens = 0
-    with (input_path.open(mode = 'r', encoding = 'utf-8') as input_file,output_path.open(mode = 'wb') as output_file):
-        for line_number, text in enumerate(input_file,start = 1):
-            token_ids = tokenizer.encode(text)
-            token_array = np.asarray(token_ids,dtype = dtype)
-            token_array.tofile(output_file)
-            num_tokens += token_array.size
-    return num_tokens
+    total_tokens = 0
+
+    with open(input_path, "r", encoding="utf-8") as source:
+        documents = iter_documents(source)  #生成器
+        token_iterator = tokenizer.encode_iterable(documents)
+
+        with open(output_path, "wb") as output:
+            while True:
+                token_batch = np.fromiter(
+                    islice(token_iterator, batch_size),
+                    dtype=dtype,
+                )
+
+                if token_batch.size == 0:
+                    break
+
+                token_batch.tofile(output)
+                total_tokens += token_batch.size
+    return total_tokens
 
 def make_fixed_batches(
         data: Int[np.ndarray,"num_tokens"], #通常是验证集memmap
