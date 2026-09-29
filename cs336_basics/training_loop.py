@@ -2,7 +2,7 @@ import numpy as np
 from bpe import train_bpe,Tokenizer
 from transformer import transformer_lm
 from optimization import AdamW ,cross_entropy,gradient_clipping, learning_rate_schedule
-from tool import save_json,data_loading,tokenize_text_to_bin,save_checkpoint, load_checkpoint
+from tool import get_batch,tokenize_text_to_bin,save_checkpoint, load_checkpoint
 from tool import log_jsonl,evaluate,make_fixed_batches
 import torch
 import torch.nn as nn
@@ -19,7 +19,7 @@ class TrainConfig:
     # 路径
     train_path: str = "data/train_data.bin"
     validation_path: str = "data/validation_data.bin"
-    out_dir: str = "result"
+    out_dir: str = "result/"
 
     # 数据类型
     data_dtype: str = "uint16"
@@ -39,7 +39,7 @@ class TrainConfig:
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
     alpha_max: float = 3e-4
-    alpha_min: float = 3e-5
+    alpha_min: float = alpha_max / 10
     total_steps: int = 5000
     T_w: int = 0
     T_c: int = total_steps
@@ -48,12 +48,12 @@ class TrainConfig:
 
     # 训练过程
     batch_size: int = 32
-    device: Literal["auto", "cpu", "cuda", "mps"] = "cpu"
+    device: Literal["auto", "cpu", "cuda", "mps"] = "cuda"
     seed: int = 0
     log_interval: int = 20    #每隔多少步记录一次训练日志
     eval_interval: int = 200   #每隔几步进行一次验证
     eval_batches: int = 10    #每次验证使用多少个 batch
-    checkpoint_interval: int = 500    #每隔多少步覆盖保存一次最新 checkpoint
+    checkpoint_interval: int = 0    #每隔多少步覆盖保存一次最新 checkpoint
     milestone_interval: int = 0     #每隔多少步额外保留一个不会被覆盖的 checkpoint
     # 是否从一个已有 checkpoint 恢复训练，以及要从哪个 checkpoint 文件恢复。
     resume_from: str | None = None
@@ -75,7 +75,8 @@ def main(config: TrainConfig) -> None:
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     #3️⃣.读取数据
-    train_data = np.memmap(config.train_path,dtype = np.dtype(config.data_dtype),mode = "r")   #将train data的txt转化为int list
+    #以 内存映射的方式读取训练集和验证集的 token ID
+    train_data = np.memmap(config.train_path,dtype = np.dtype(config.data_dtype),mode = "r")   #将train data的bin转化为int list
     validation_data = np.memmap(config.validation_path,dtype = np.dtype(config.data_dtype),mode ="r")
     #4️⃣.创建模型
     model = transformer_lm(
@@ -103,10 +104,14 @@ def main(config: TrainConfig) -> None:
     #6️⃣是否需要恢复checkpoint
     #默认无需恢复checkpoint，从0开始训练，但如果需要恢复，则从恢复点开始训练
     start_step = 0
-    if config.resume_from is not None:
+    if config.resume_from:
         start_step = load_checkpoint(config.resume_from, model, optimizer)
         print(f"[resume] 从 {config.resume_from} 恢复,从第 {start_step} 步继续")
-    #7️⃣.正式开始训练并计时
+
+    #7️⃣从验证集中预先采样的一组固定 batch
+    validation_batches = make_fixed_batches(validation_data, config.batch_size,
+                        config.seq_len,config.device, config.eval_batches, config.seed + 1)
+    #8️⃣.正式开始训练并计时
     t0 = time.perf_counter()
     tokens_per_step = config.batch_size * config.seq_len
     loss_value = float("nan")
@@ -119,7 +124,7 @@ def main(config: TrainConfig) -> None:
         # 2.清除旧梯度
         optimizer.zero_grad(set_to_none=True)
         # 3. 采样一个batch
-        inputs, targets = data_loading(train_data, config.batch_size,config.seq_len, config.device)
+        inputs, targets = get_batch(train_data, config.batch_size,config.seq_len, config.device)
         # 4. 前向传播 + 计算loss + 反向传播
         logits = model(inputs)
         loss = cross_entropy(logits, targets)
@@ -129,15 +134,12 @@ def main(config: TrainConfig) -> None:
         # 6. AdamW更新参数
         optimizer.step()
 
-        #从验证集中预先采样的一组固定 batch
-        validation_batches = make_fixed_batches(validation_data, config.batch_size,
-                                         config.seq_len,config.device, config.eval_batches, config.seed + 1)
         
         # 7. 周期性完成日志、验证、checkpoint等记录任务
         #need_log:当前训练 step 是否需要打印并保存训练日志
         need_log = None
         if config.log_interval > 0:
-            need_log = ((step+1) % config.log_interval == 0) or ((step+1) == config.total_steps - 1)
+            need_log = ((step+1) % config.log_interval == 0) or ((step+1) == config.total_steps)
         if need_log:
             loss_value = loss.item()  #储存loss数值
             elapsed = time.perf_counter() - t0  #到目前为止训练的总时长

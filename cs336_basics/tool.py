@@ -11,13 +11,13 @@ from cs336_basics.bpe import Tokenizer
 from optimization import cross_entropy
 from itertools import islice
 
-def data_loading(
+def get_batch(
         token_ids: Int[np.ndarray,"num_tokens"],
         batch_size: int,
         seq_len: int,
         device = None
 ) -> tuple[Int[Tensor,"batch_size seq_len"], Int[Tensor,"batch_size seq_len"]]:
-    """data_loading 输入使用 NumPy array，主要是因为这里的 dataset 代表完整的 token 数据集，
+    """get_batch 输入使用 NumPy array，主要是因为这里的 dataset 代表完整的 token 数据集，
     它可能非常大；PyTorch Tensor 则更适合作为已经采样出来、即将送进模型的小 batch。"""
     """
     随机在整个token_ids上采样batch_size次，每次的长度seq_len
@@ -143,7 +143,7 @@ def make_fixed_batches(
     """
     state = np.random.get_state()
     np.random.seed(seed)
-    batches = [data_loading(data, batch_size, context_length, device) for _ in range(num_batches)]
+    batches = [get_batch(data, batch_size, context_length, device) for _ in range(num_batches)]
     np.random.set_state(state)
     return batches
 

@@ -71,7 +71,8 @@ def learning_rate_schedule(t,alpha_max,alpha_min,T_w,T_c) -> float:
         return alpha_min + (1/2) * (1 + cos(((t-T_w)/(T_c-T_w))*pi)) * (alpha_max-alpha_min)
     else:
         return alpha_min
-@torch.no_grad
+    
+@torch.no_grad()
 def gradient_clipping(params, M, eps = 1e-6):
     grads = [p.grad for p in params if p.grad is not None]
     if len(grads) == 0:
